@@ -1,18 +1,24 @@
 # -*- coding: utf-8 -*-
 # ViewState Decoder - Burp Suite Extension
 # Language: Python (Jython 2.7)
-# Install: Extender > Extensions > Add > Extension type: Python
 
-from burp import IBurpExtender, ITab
+from burp import (IBurpExtender, ITab, IContextMenuFactory,
+                  IMessageEditorTabFactory, IMessageEditorTab)
 from javax.swing import (JPanel, JTextArea, JButton, JLabel, JScrollPane,
                          JSplitPane, BorderFactory, SwingConstants, ButtonGroup,
-                         JToggleButton)
+                         JToggleButton, JMenuItem, SwingUtilities)
 from javax.swing.border import EmptyBorder
+from javax.swing.text import DefaultHighlighter
 from java.awt import (BorderLayout, Color, Font, Dimension, FlowLayout)
+from java.util import ArrayList
 import base64
 import zlib
 import struct
+import urllib
+import re
+import java.awt.event
 
+# ── Palette ───────────────────────────────────────────────────────────────────
 BG_WHITE   = Color(255, 255, 255)
 BG_LIGHT   = Color(245, 246, 248)
 BG_PANEL   = Color(235, 237, 241)
@@ -22,7 +28,6 @@ ACCENT2    = Color(180,  90,   0)
 FG_MAIN    = Color(30,   30,  30)
 FG_DIM     = Color(120, 120, 130)
 FG_RED     = Color(180,  30,  30)
-BTN_SEL_BG = Color(200, 220, 205)
 BTN_DEF_BG = Color(210, 212, 218)
 BORDER_CLR = Color(200, 202, 208)
 
@@ -33,33 +38,153 @@ VIEW_STRINGS = "STRINGS"
 VIEW_HEX     = "HEX DUMP"
 VIEW_TOKENS  = "TOKENS"
 
-import java.awt.event
+# ── Highlight rules ───────────────────────────────────────────────────────────
+# (label, color, [keywords...], case_sensitive)
+HIGHLIGHT_RULES = [
+    ("Role / Privilege",
+     Color(255, 200,  80),   # amber
+     ["role", "admin", "superuser", "privilege", "permission",
+      "isadmin", "isauthenticated", "isauthorized", "access"],
+     False),
+
+    ("Credentials",
+     Color(255, 130, 130),   # red-pink
+     ["password", "passwd", "pwd", "secret", "token",
+      "apikey", "api_key", "credential"],
+     False),
+
+    ("User Identity",
+     Color(130, 200, 255),   # sky blue
+     ["username", "userid", "user_id", "uid", "email",
+      "fullname", "displayname", "firstname", "lastname"],
+     False),
+
+    ("Boolean Flag",
+     Color(160, 230, 160),   # green
+     ["true", "false", "enabled", "disabled",
+      "active", "inactive", "locked", "verified"],
+     False),
+
+    ("Version / Build",
+     Color(210, 170, 255),   # lavender
+     ["version", "ver=", "build", "release", "revision",
+      "publickey", "publickeytoken"],
+     False),
+
+    ("Session / ID",
+     Color(255, 200, 150),   # peach
+     ["session", "sessionid", "viewstate", "requestid",
+      "correlationid", "transactionid"],
+     False),
+]
 
 
+def apply_highlights(text_area, text):
+    """Scan text and apply background highlights for interesting keywords."""
+    hl      = text_area.getHighlighter()
+    hl.removeAllHighlights()
+    if not text:
+        return
+
+    low = text.lower()
+    for (label, color, keywords, case_sensitive) in HIGHLIGHT_RULES:
+        painter = DefaultHighlighter.DefaultHighlightPainter(color)
+        haystack = text if case_sensitive else low
+        for kw in keywords:
+            needle = kw if case_sensitive else kw.lower()
+            start  = 0
+            while True:
+                idx = haystack.find(needle, start)
+                if idx == -1:
+                    break
+                try:
+                    hl.addHighlight(idx, idx + len(needle), painter)
+                except Exception:
+                    pass
+                start = idx + 1
+
+
+# ── Legend panel ──────────────────────────────────────────────────────────────
+def build_legend():
+    panel = JPanel(FlowLayout(FlowLayout.LEFT, 8, 4))
+    panel.setBackground(BG_LIGHT)
+    panel.setBorder(BorderFactory.createCompoundBorder(
+        BorderFactory.createMatteBorder(1, 0, 0, 0, BORDER_CLR),
+        EmptyBorder(3, 8, 3, 8)
+    ))
+
+    lbl = JLabel("Highlight: ")
+    lbl.setFont(Font("SansSerif", Font.BOLD, 10))
+    lbl.setForeground(FG_DIM)
+    panel.add(lbl)
+
+    for (label, color, _, _) in HIGHLIGHT_RULES:
+        chip = JLabel("  %s  " % label)
+        chip.setFont(Font("SansSerif", Font.PLAIN, 10))
+        chip.setForeground(FG_MAIN)
+        chip.setOpaque(True)
+        chip.setBackground(color)
+        chip.setBorder(BorderFactory.createLineBorder(color.darker(), 1))
+        panel.add(chip)
+
+    return panel
+
+
+# ── ViewState parser ──────────────────────────────────────────────────────────
 class ViewStateParser(object):
+
+    def extract_viewstate(self, body_str):
+        match = re.search(r'__VIEWSTATE(?:X\d+)?=([^&\s"\'<>]+)', body_str)
+        if match:
+            return match.group(1)
+        match2 = re.search(r'id="__VIEWSTATE[^"]*"[^>]*value="([^"]+)"', body_str)
+        if match2:
+            return match2.group(1)
+        return None
 
     def decode_all(self, vs_string):
         vs_string = vs_string.strip()
         result = {"strings": "", "hex": "", "tokens": "", "error": ""}
+
+        url_decoded = False
+        if "%" in vs_string:
+            try:
+                vs_string = urllib.unquote(vs_string)
+                url_decoded = True
+            except Exception as e:
+                result["error"] = "[ERROR] URL decode failed: %s" % str(e)
+                return result
+
+        vs_b64 = vs_string
+        pad = len(vs_b64) % 4
+        if pad:
+            vs_b64 += "=" * (4 - pad)
+
         try:
-            raw = base64.b64decode(vs_string)
+            raw = base64.b64decode(vs_b64)
         except Exception as e:
             result["error"] = "[ERROR] Base64 decode failed: %s" % str(e)
             return result
 
         decompressed = raw
-        info_line = "[INFO] No compression detected (raw)"
+        compress_info = "No compression (raw)"
         try:
             decompressed = zlib.decompress(raw, 16 + zlib.MAX_WBITS)
-            info_line = "[INFO] Decompressed with gzip"
+            compress_info = "Decompressed: gzip"
         except Exception:
             try:
                 decompressed = zlib.decompress(raw, -zlib.MAX_WBITS)
-                info_line = "[INFO] Decompressed with deflate"
+                compress_info = "Decompressed: deflate"
             except Exception:
                 pass
 
-        header = "%s\n[INFO] Total bytes: %d\n" % (info_line, len(decompressed))
+        steps = []
+        if url_decoded:
+            steps.append("[Step 1] URL Decode        : OK")
+        steps.append("[Step 2] Base64 Decode     : OK  (%d bytes)" % len(raw))
+        steps.append("[Step 3] %s" % compress_info)
+        steps.append("[INFO]   Total bytes       : %d" % len(decompressed))
+        header = "\n".join(steps) + "\n"
 
         strings = self._extract_strings(decompressed)
         result["strings"] = header + "\n" + "\n".join("  " + s for s in strings)
@@ -69,6 +194,7 @@ class ViewStateParser(object):
             result["tokens"] = header + "\n" + "\n".join(tokens)
         except Exception as e:
             result["tokens"] = header + "\n[WARN] %s" % str(e)
+
         return result
 
     def _hex_dump(self, data):
@@ -76,8 +202,8 @@ class ViewStateParser(object):
         for i in range(0, len(data), 16):
             chunk = data[i:i+16]
             byte_list = [ord(c) for c in chunk] if isinstance(chunk, str) else list(chunk)
-            hex_part = " ".join("%02x" % b for b in byte_list)
-            asc_part = "".join(chr(b) if 32 <= b < 127 else "." for b in byte_list)
+            hex_part  = " ".join("%02x" % b for b in byte_list)
+            asc_part  = "".join(chr(b) if 32 <= b < 127 else "." for b in byte_list)
             rows.append("%06x  %-47s  %s" % (i, hex_part, asc_part))
         return "\n".join(rows)
 
@@ -126,17 +252,235 @@ class ViewStateParser(object):
         return tokens if tokens else ["(no recognisable LosFormatter tokens found)"]
 
 
+# ── Reusable output panel (used in both main tab & editor tab) ────────────────
+class OutputPanel(JPanel):
+
+    def __init__(self):
+        JPanel.__init__(self, BorderLayout())
+        self.setBackground(BG_WHITE)
+        self._decoded   = {}
+        self._cur_view  = VIEW_STRINGS
+
+        # Toggle bar
+        top = JPanel(FlowLayout(FlowLayout.LEFT, 6, 6))
+        top.setBackground(BG_LIGHT)
+        top.setBorder(EmptyBorder(4, 8, 4, 8))
+
+        lbl = JLabel("Show: ")
+        lbl.setFont(LABEL_FONT)
+        lbl.setForeground(FG_DIM)
+        top.add(lbl)
+
+        bg = ButtonGroup()
+        self._btn_strings = self._make_toggle("STRINGS",  VIEW_STRINGS, bg, top, True)
+        self._btn_hex     = self._make_toggle("HEX DUMP", VIEW_HEX,     bg, top)
+        self._btn_tokens  = self._make_toggle("TOKENS",   VIEW_TOKENS,  bg, top)
+
+        # Output textarea
+        self._txt = JTextArea()
+        self._txt.setFont(MONO_FONT)
+        self._txt.setBackground(BG_WHITE)
+        self._txt.setForeground(FG_MAIN)
+        self._txt.setCaretColor(FG_MAIN)
+        self._txt.setEditable(False)
+        self._txt.setLineWrap(False)
+        self._txt.setBorder(EmptyBorder(8, 8, 8, 8))
+
+        scroll = JScrollPane(self._txt)
+        scroll.setBorder(BorderFactory.createLineBorder(BORDER_CLR, 1))
+
+        legend = build_legend()
+
+        center = JPanel(BorderLayout())
+        center.setBackground(BG_WHITE)
+        center.add(scroll,  BorderLayout.CENTER)
+        center.add(legend,  BorderLayout.SOUTH)
+
+        self.add(top,    BorderLayout.NORTH)
+        self.add(center, BorderLayout.CENTER)
+
+    def _make_toggle(self, label, view_key, group, parent, selected=False):
+        btn = JToggleButton(label, selected)
+        btn.setFont(Font("SansSerif", Font.BOLD, 11))
+        btn.setPreferredSize(Dimension(110, 26))
+        btn.setFocusPainted(False)
+        btn.setOpaque(True)
+
+        if selected:
+            btn.setBackground(ACCENT)
+            btn.setForeground(BG_WHITE)
+        else:
+            btn.setBackground(BTN_DEF_BG)
+            btn.setForeground(FG_DIM)
+
+        group.add(btn)
+        parent.add(btn)
+        panel = self
+
+        class Listener(java.awt.event.ActionListener):
+            def actionPerformed(self, e):
+                panel._cur_view = view_key
+                for b, k in [(panel._btn_strings, VIEW_STRINGS),
+                             (panel._btn_hex,     VIEW_HEX),
+                             (panel._btn_tokens,  VIEW_TOKENS)]:
+                    if k == view_key:
+                        b.setBackground(ACCENT)
+                        b.setForeground(BG_WHITE)
+                    else:
+                        b.setBackground(BTN_DEF_BG)
+                        b.setForeground(FG_DIM)
+                panel.refresh()
+
+        btn.addActionListener(Listener())
+        return btn
+
+    def set_decoded(self, decoded):
+        self._decoded = decoded
+        self.refresh()
+
+    def refresh(self):
+        if not self._decoded:
+            return
+        if self._decoded.get("error"):
+            self._txt.setText(self._decoded["error"])
+            self._txt.getHighlighter().removeAllHighlights()
+            return
+
+        if self._cur_view == VIEW_STRINGS:
+            text = self._decoded.get("strings", "")
+        elif self._cur_view == VIEW_HEX:
+            text = self._decoded.get("hex", "")
+        else:
+            text = self._decoded.get("tokens", "")
+
+        self._txt.setText(text)
+        self._txt.setCaretPosition(0)
+
+        # Apply highlights only on STRINGS view
+        if self._cur_view == VIEW_STRINGS:
+            apply_highlights(self._txt, text)
+        else:
+            self._txt.getHighlighter().removeAllHighlights()
+
+    def get_text(self):
+        return self._txt.getText()
+
+
+# ── Message Editor Tab ────────────────────────────────────────────────────────
+class ViewStateEditorTab(IMessageEditorTab):
+
+    def __init__(self, helpers):
+        self._helpers = helpers
+        self._parser  = ViewStateParser()
+        self._out     = OutputPanel()
+
+    def getTabCaption(self):
+        return "ViewState"
+
+    def getUiComponent(self):
+        return self._out
+
+    def isEnabled(self, content, isRequest):
+        if content is None:
+            return False
+        try:
+            body = self._helpers.bytesToString(content)
+            return bool(self._parser.extract_viewstate(body))
+        except Exception:
+            return False
+
+    def setMessage(self, content, isRequest):
+        if content is None:
+            self._out.set_decoded({})
+            return
+        try:
+            body     = self._helpers.bytesToString(content)
+            vs_value = self._parser.extract_viewstate(body)
+            if vs_value:
+                self._out.set_decoded(self._parser.decode_all(vs_value))
+            else:
+                self._out.set_decoded({"error": "(no __VIEWSTATE found)"})
+        except Exception as e:
+            self._out.set_decoded({"error": "[ERROR] " + str(e)})
+
+    def getMessage(self):
+        return None
+
+    def isModified(self):
+        return False
+
+    def getSelectedData(self):
+        sel = self._out.get_text()
+        return self._helpers.stringToBytes(sel or "")
+
+
+class ViewStateTabFactory(IMessageEditorTabFactory):
+    def __init__(self, helpers):
+        self._helpers = helpers
+
+    def createNewInstance(self, controller, editable):
+        return ViewStateEditorTab(self._helpers)
+
+
+# ── Context Menu ──────────────────────────────────────────────────────────────
+class ViewStateContextMenu(IContextMenuFactory):
+
+    def __init__(self, extender):
+        self._ext = extender
+
+    def createMenuItems(self, invocation):
+        items  = ArrayList()
+        item   = JMenuItem("Send __VIEWSTATE to Decoder")
+        ext    = self._ext
+        inv    = invocation
+        parser = ViewStateParser()
+
+        class ML(java.awt.event.ActionListener):
+            def actionPerformed(self, e):
+                try:
+                    msgs = inv.getSelectedMessages()
+                    if not msgs:
+                        return
+                    msg = msgs[0]
+                    vs  = None
+                    req = msg.getRequest()
+                    if req:
+                        vs = parser.extract_viewstate(
+                            ext._helpers.bytesToString(req))
+                    if vs is None:
+                        resp = msg.getResponse()
+                        if resp:
+                            vs = parser.extract_viewstate(
+                                ext._helpers.bytesToString(resp))
+                    if vs is None:
+                        ext._set_status("No __VIEWSTATE found.", FG_RED)
+                        return
+
+                    def run():
+                        ext._input_area.setText(vs)
+                        ext._do_decode(vs)
+                    SwingUtilities.invokeLater(run)
+                except Exception as ex:
+                    ext._set_status("Error: %s" % str(ex), FG_RED)
+
+        item.addActionListener(ML())
+        items.add(item)
+        return items
+
+
+# ── Main Extender ─────────────────────────────────────────────────────────────
 class BurpExtender(IBurpExtender, ITab):
 
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers   = callbacks.getHelpers()
         callbacks.setExtensionName("ViewState Decoder")
-        self._parser   = ViewStateParser()
-        self._decoded  = {}
-        self._cur_view = VIEW_STRINGS
+        self._parser    = ViewStateParser()
         self._build_ui()
         callbacks.addSuiteTab(self)
+        callbacks.registerContextMenuFactory(ViewStateContextMenu(self))
+        callbacks.registerMessageEditorTabFactory(
+            ViewStateTabFactory(self._helpers))
         print("[ViewState Decoder] Loaded OK")
 
     def getTabCaption(self):
@@ -158,14 +502,16 @@ class BurpExtender(IBurpExtender, ITab):
         title.setFont(Font("SansSerif", Font.BOLD, 16))
         title.setForeground(ACCENT)
 
-        subtitle = JLabel("Telerik / ASP.NET  |  Base64 + LosFormatter", SwingConstants.RIGHT)
+        subtitle = JLabel(
+            "Telerik / ASP.NET  |  URL + Base64 + LosFormatter  |  Auto-highlight",
+            SwingConstants.RIGHT)
         subtitle.setFont(Font("SansSerif", Font.PLAIN, 11))
         subtitle.setForeground(FG_DIM)
 
         header.add(title,    BorderLayout.WEST)
         header.add(subtitle, BorderLayout.EAST)
 
-        # Input panel
+        # Input
         input_panel = JPanel(BorderLayout())
         input_panel.setBackground(BG_LIGHT)
         input_panel.setBorder(BorderFactory.createCompoundBorder(
@@ -173,7 +519,7 @@ class BurpExtender(IBurpExtender, ITab):
             EmptyBorder(10, 10, 10, 10)
         ))
 
-        input_label = JLabel("  __VIEWSTATE  (paste Base64 value here)")
+        input_label = JLabel("  __VIEWSTATE  (paste Base64 or URL-encoded value here)")
         input_label.setFont(LABEL_FONT)
         input_label.setForeground(ACCENT2)
         input_label.setBorder(EmptyBorder(0, 0, 6, 0))
@@ -197,50 +543,18 @@ class BurpExtender(IBurpExtender, ITab):
         action_panel = JPanel(FlowLayout(FlowLayout.CENTER, 12, 8))
         action_panel.setBackground(BG_PANEL)
 
-        self._decode_btn = self._make_btn("[DECODE]",      ACCENT,  Color(220,240,228), self._on_decode)
-        self._clear_btn  = self._make_btn("[CLEAR]",       ACCENT2, Color(245,230,210), self._on_clear)
-        self._copy_btn   = self._make_btn("[COPY OUTPUT]", FG_DIM,  BG_PANEL,           self._on_copy)
+        self._decode_btn = self._make_btn("[DECODE]",      ACCENT,  Color(220, 240, 228), self._on_decode)
+        self._clear_btn  = self._make_btn("[CLEAR]",       ACCENT2, Color(245, 230, 210), self._on_clear)
+        self._copy_btn   = self._make_btn("[COPY OUTPUT]", FG_DIM,  BG_PANEL,             self._on_copy)
 
         action_panel.add(self._decode_btn)
         action_panel.add(self._clear_btn)
         action_panel.add(self._copy_btn)
 
-        # View toggle buttons
-        view_panel = JPanel(FlowLayout(FlowLayout.LEFT, 6, 8))
-        view_panel.setBackground(BG_LIGHT)
-        view_panel.setBorder(EmptyBorder(4, 8, 0, 8))
+        # Output (reuse OutputPanel)
+        self._out_panel = OutputPanel()
 
-        view_lbl = JLabel("Show: ")
-        view_lbl.setFont(LABEL_FONT)
-        view_lbl.setForeground(FG_DIM)
-        view_panel.add(view_lbl)
-
-        bg = ButtonGroup()
-        self._btn_strings = self._make_toggle("STRINGS",  VIEW_STRINGS, bg, view_panel, selected=True)
-        self._btn_hex     = self._make_toggle("HEX DUMP", VIEW_HEX,     bg, view_panel)
-        self._btn_tokens  = self._make_toggle("TOKENS",   VIEW_TOKENS,  bg, view_panel)
-
-        # Output panel
-        output_panel = JPanel(BorderLayout())
-        output_panel.setBackground(BG_WHITE)
-        output_panel.setBorder(EmptyBorder(0, 10, 10, 10))
-
-        output_panel.add(view_panel, BorderLayout.NORTH)
-
-        self._output_area = JTextArea()
-        self._output_area.setFont(MONO_FONT)
-        self._output_area.setBackground(BG_WHITE)
-        self._output_area.setForeground(FG_MAIN)
-        self._output_area.setCaretColor(FG_MAIN)
-        self._output_area.setEditable(False)
-        self._output_area.setLineWrap(False)
-        self._output_area.setBorder(EmptyBorder(8, 8, 8, 8))
-
-        output_scroll = JScrollPane(self._output_area)
-        output_scroll.setBorder(BorderFactory.createLineBorder(BORDER_CLR, 1))
-        output_panel.add(output_scroll, BorderLayout.CENTER)
-
-        # Status bar
+        # Status
         self._status = JLabel("  Ready")
         self._status.setFont(Font("SansSerif", Font.PLAIN, 11))
         self._status.setForeground(FG_DIM)
@@ -250,13 +564,12 @@ class BurpExtender(IBurpExtender, ITab):
         status_panel.setBackground(BG_PANEL)
         status_panel.add(self._status, BorderLayout.WEST)
 
-        # Split
         top_half = JPanel(BorderLayout())
         top_half.setBackground(BG_WHITE)
         top_half.add(input_panel,  BorderLayout.CENTER)
         top_half.add(action_panel, BorderLayout.SOUTH)
 
-        splitter = JSplitPane(JSplitPane.VERTICAL_SPLIT, top_half, output_panel)
+        splitter = JSplitPane(JSplitPane.VERTICAL_SPLIT, top_half, self._out_panel)
         splitter.setDividerLocation(220)
         splitter.setDividerSize(3)
         splitter.setBackground(BORDER_CLR)
@@ -278,83 +591,37 @@ class BurpExtender(IBurpExtender, ITab):
         btn.addActionListener(listener)
         return btn
 
-    def _make_toggle(self, label, view_key, group, parent, selected=False):
-        btn = JToggleButton(label, selected)
-        btn.setFont(Font("SansSerif", Font.BOLD, 11))
-        btn.setPreferredSize(Dimension(110, 26))
-        btn.setFocusPainted(False)
-        btn.setOpaque(True)
-
-        if selected:
-            btn.setBackground(ACCENT)
-            btn.setForeground(BG_WHITE)
-        else:
-            btn.setBackground(BTN_DEF_BG)
-            btn.setForeground(FG_DIM)
-
-        group.add(btn)
-        parent.add(btn)
-
-        ext = self
-
-        class Listener(java.awt.event.ActionListener):
-            def actionPerformed(self, e):
-                ext._cur_view = view_key
-                for b, k in [(ext._btn_strings, VIEW_STRINGS),
-                             (ext._btn_hex,     VIEW_HEX),
-                             (ext._btn_tokens,  VIEW_TOKENS)]:
-                    if k == view_key:
-                        b.setBackground(ACCENT)
-                        b.setForeground(BG_WHITE)
-                    else:
-                        b.setBackground(BTN_DEF_BG)
-                        b.setForeground(FG_DIM)
-                ext._refresh_output()
-
-        btn.addActionListener(Listener())
-        return btn
-
-    def _refresh_output(self):
-        if not self._decoded:
-            return
-        if self._decoded.get("error"):
-            self._output_area.setText(self._decoded["error"])
-            return
-        if self._cur_view == VIEW_STRINGS:
-            self._output_area.setText(self._decoded.get("strings", ""))
-        elif self._cur_view == VIEW_HEX:
-            self._output_area.setText(self._decoded.get("hex", ""))
-        else:
-            self._output_area.setText(self._decoded.get("tokens", ""))
-        self._output_area.setCaretPosition(0)
+    def _do_decode(self, vs_value):
+        self._set_status("Decoding...", FG_DIM)
+        try:
+            decoded = self._parser.decode_all(vs_value)
+            self._out_panel.set_decoded(decoded)
+            if decoded.get("error"):
+                self._set_status(decoded["error"], FG_RED)
+            else:
+                url_note = "  [URL-decoded first]" if "%" in vs_value else ""
+                self._set_status(
+                    "Done  %d chars decoded.%s" % (len(vs_value), url_note), ACCENT)
+        except Exception as e:
+            self._out_panel.set_decoded({"error": "[ERROR] " + str(e)})
+            self._set_status("Error during decode.", FG_RED)
 
     def _on_decode(self, event):
         vs = self._input_area.getText().strip()
         if not vs:
             self._set_status("No input.", FG_RED)
             return
-        self._set_status("Decoding...", FG_DIM)
-        try:
-            self._decoded = self._parser.decode_all(vs)
-            self._refresh_output()
-            if self._decoded.get("error"):
-                self._set_status(self._decoded["error"], FG_RED)
-            else:
-                self._set_status("Done  %d bytes decoded." % len(vs), ACCENT)
-        except Exception as e:
-            self._output_area.setText("[ERROR] " + str(e))
-            self._set_status("Error during decode.", FG_RED)
+        self._do_decode(vs)
 
     def _on_clear(self, event):
         self._input_area.setText("")
-        self._output_area.setText("")
-        self._decoded = {}
+        self._out_panel.set_decoded({})
         self._set_status("Cleared.", FG_DIM)
 
     def _on_copy(self, event):
         from java.awt.datatransfer import StringSelection
         from java.awt import Toolkit
-        text = self._output_area.getText()
+        text = self._out_panel.get_text()
         if text:
             sel = StringSelection(text)
             Toolkit.getDefaultToolkit().getSystemClipboard().setContents(sel, None)
